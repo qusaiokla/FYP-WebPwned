@@ -1,0 +1,593 @@
+import argparse
+import base64
+import csv
+import json
+import re
+import time
+from datetime import datetime
+
+import requests
+
+
+# =====================================================
+# PUT YOUR GITHUB TOKEN HERE
+# Example:
+# GITHUB_TOKEN = "github_pat_xxxxxxxxxxxxxxxxx"
+# =====================================================
+
+GITHUB_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+# =====================================================
+
+GITHUB_API = "https://api.github.com"
+
+REQUEST_TIMEOUT = 20
+PER_PAGE = 30
+DEFAULT_DELAY = 3
+DEFAULT_RETRIES = 3
+
+
+DORKS = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AKIA",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "github_pat_",
+    "NPM_TOKEN",
+    "API_KEY",
+    "API_SECRET",
+    "ACCESS_TOKEN",
+    "AUTH_TOKEN",
+    "CLIENT_SECRET",
+    "SECRET_KEY",
+    "DB_PASSWORD",
+    "DATABASE_PASSWORD",
+    "PASSWORD",
+    "PRIVATE_KEY",
+    "JWT_SECRET",
+    ".env",
+    ".npmrc",
+    "credentials.json",
+    "service_account.json",
+    "id_rsa",
+    "s3_bucket",
+    "S3_BUCKET",
+    "S3_BUCKET_NAME",
+    "AWS_S3_BUCKET",
+    "BUCKET_NAME",
+    "bucketName",
+    "amazonaws.com",
+    "s3.amazonaws.com",
+    ".s3.amazonaws.com",
+    ".s3-website",
+    "client_secret",
+    "access_token",
+    "api_key",
+    "secret_access_key",
+    "x-api-key",
+    "bearer",
+    "token",
+    "password",
+]
+
+
+FILENAME_DORKS = [
+    "filename:.env",
+    "filename:.npmrc",
+    "filename:.git-credentials",
+    "filename:credentials.json",
+    "filename:service_account.json",
+    "filename:wp-config.php",
+    "filename:settings.py",
+    "filename:secrets.yml",
+    "filename:database.yml",
+    "filename:id_rsa",
+    "filename:id_dsa",
+    "filename:config.php",
+    "filename:config.json",
+    "filename:application.yml",
+    "filename:application.properties",
+]
+
+
+PATTERNS = {
+    "AWS Access Key": r"AKIA[0-9A-Z]{16}",
+    "GitHub Token": r"(gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,})",
+    "Google API Key": r"AIza[0-9A-Za-z\-_]{35}",
+    "JWT Token": r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+    "Private Key": r"-----BEGIN (RSA|DSA|EC|OPENSSH|PGP)? ?PRIVATE KEY-----",
+    "Password Assignment": r"(?i)(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{6,}['\"]",
+    "Secret Assignment": r"(?i)(secret|client_secret|app_secret)\s*[:=]\s*['\"][A-Za-z0-9_\-./+=]{8,}['\"]",
+    "Token Assignment": r"(?i)(token|access_token|auth_token|refresh_token)\s*[:=]\s*['\"][A-Za-z0-9_\-./+=]{8,}['\"]",
+    "API Key Assignment": r"(?i)(api_key|apikey|x-api-key|apiSecret)\s*[:=]\s*['\"][A-Za-z0-9_\-./+=]{8,}['\"]",
+    "Database URL": r"(?i)(mysql|postgres|postgresql|mongodb|redis):\/\/[^\s\"']+",
+    "S3 Bucket URL": r"https?://[a-zA-Z0-9.\-_]+\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com[^\s\"'<>]*",
+    "S3 Website Bucket": r"https?://[a-zA-Z0-9.\-_]+\.s3-website[.-][a-z0-9-]+\.amazonaws\.com[^\s\"'<>]*",
+    "S3 Path Style Bucket": r"https?://s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com\/[a-zA-Z0-9.\-_]+[^\s\"'<>]*",
+    "S3 Bucket Name Assignment": r"(?i)(s3_bucket|s3Bucket|bucket_name|bucketName|AWS_S3_BUCKET|S3_BUCKET_NAME)\s*[:=]\s*['\"]?[a-z0-9.\-_]{3,63}['\"]?",
+}
+
+
+def headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "WebPwn-GitHunter"
+    }
+
+
+def github_get(url, params=None, retries=DEFAULT_RETRIES):
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(
+                url,
+                headers=headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if response.status_code == 403:
+                reset = response.headers.get("X-RateLimit-Reset")
+
+                if reset:
+                    wait_time = max(int(reset) - int(time.time()), 1)
+                    print(f"[-] GitHub rate limit. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time + 2)
+                    continue
+
+                print("[-] GitHub permission/rate-limit issue.")
+                return response
+
+            if response.status_code == 429:
+                print("[-] Too many requests. Waiting 30 seconds...")
+                time.sleep(30)
+                continue
+
+            return response
+
+        except requests.exceptions.ReadTimeout:
+            print(f"[-] Timeout. Retry {attempt}/{retries}...")
+            time.sleep(3)
+
+        except requests.exceptions.ConnectionError:
+            print(f"[-] Connection error. Retry {attempt}/{retries}...")
+            time.sleep(5)
+
+        except requests.exceptions.RequestException as error:
+            print(f"[-] Request error: {error}")
+            time.sleep(3)
+
+    return None
+
+
+def validate_token():
+    response = github_get(f"{GITHUB_API}/user")
+
+    if not response:
+        print("[-] Could not contact GitHub API.")
+        return False
+
+    if response.status_code == 200:
+        print("[+] GitHub token valid")
+        return True
+
+    print(f"[-] Token invalid: {response.status_code}")
+    print(response.text[:200])
+    return False
+
+
+def clean_target(target):
+    target = target.lower().strip()
+    target = target.replace("https://", "")
+    target = target.replace("http://", "")
+    target = target.replace("www.", "")
+    target = target.split("/")[0]
+    return target
+
+
+def generate_keywords(target):
+    target = clean_target(target)
+    keywords = set()
+
+    keywords.add(target)
+
+    if "." in target:
+        root = target.split(".")[0]
+        keywords.add(root)
+        keywords.add("@" + target)
+
+    if "amazon" in target:
+        keywords.update(["aws", "amazonaws"])
+
+    if "google" in target:
+        keywords.update(["gcp", "firebase", "googleapis"])
+
+    if "microsoft" in target:
+        keywords.update(["azure", "office365"])
+
+    if "paypal" in target:
+        keywords.update(["paypalobjects"])
+
+    if "ford" in target:
+        keywords.update(["ford", "ford.com"])
+
+    return sorted(keywords)
+
+
+def mask_secret(value):
+    value = str(value).strip()
+
+    if len(value) <= 12:
+        return value[:2] + "***"
+
+    return value[:6] + "***" + value[-4:]
+
+
+def search_github(query, max_pages):
+    results = []
+
+    for page in range(1, max_pages + 1):
+        response = github_get(
+            f"{GITHUB_API}/search/code",
+            params={
+                "q": query,
+                "per_page": PER_PAGE,
+                "page": page
+            }
+        )
+
+        if not response:
+            print("[-] GitHub request failed. Skipping query.")
+            break
+
+        if response.status_code == 422:
+            print("[-] GitHub rejected query. Skipping.")
+            break
+
+        if response.status_code != 200:
+            print(f"[-] GitHub Error {response.status_code}: {response.text[:120]}")
+            break
+
+        data = response.json()
+        items = data.get("items", [])
+
+        if not items:
+            break
+
+        results.extend(items)
+
+        if len(items) < PER_PAGE:
+            break
+
+    return results
+
+
+def get_file_content(api_url):
+    response = github_get(api_url)
+
+    if not response:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        return None
+
+    if data.get("encoding") != "base64":
+        return None
+
+    try:
+        return base64.b64decode(
+            data.get("content", "")
+        ).decode(
+            "utf-8",
+            errors="ignore"
+        )
+
+    except Exception:
+        return None
+
+
+def scan_text(text):
+    findings = []
+    seen = set()
+
+    for category, pattern in PATTERNS.items():
+        try:
+            for match in re.finditer(pattern, text):
+                raw_match = match.group(0).strip()
+                line = text[:match.start()].count("\n") + 1
+
+                duplicate_key = f"{category}:{raw_match}:{line}"
+
+                if duplicate_key in seen:
+                    continue
+
+                seen.add(duplicate_key)
+
+                findings.append({
+                    "category": category,
+                    "match": mask_secret(raw_match),
+                    "raw_match": raw_match,
+                    "line": line
+                })
+
+        except re.error:
+            continue
+
+    return findings
+
+
+def build_queries(target, max_dorks):
+    keywords = generate_keywords(target)
+    dorks = DORKS[:max_dorks]
+
+    queries = []
+
+    for keyword in keywords:
+        for dork in dorks:
+            queries.append(f'"{keyword}" "{dork}"')
+
+    clean = clean_target(target)
+    company = clean.split(".")[0]
+
+    for file_dork in FILENAME_DORKS:
+        queries.append(f'"{company}" {file_dork}')
+
+    deep_queries = [
+        f'"{company}" "client_secret"',
+        f'"{company}" "access_token"',
+        f'"{company}" "api_key"',
+        f'"{company}" "secret_access_key"',
+        f'"{company}" "s3.amazonaws.com"',
+        f'"{company}" "amazonaws.com"',
+        f'"{company}" "S3_BUCKET_NAME"',
+        f'"{company}" "AWS_S3_BUCKET"',
+        f'"{company}" "bucketName"',
+        f'"@{clean}" "password"',
+        f'"@{clean}" "token"',
+        f'"@{clean}" "secret"',
+        f'"{clean}" "client_secret"',
+        f'"{clean}" "access_token"',
+        f'"{clean}" "api_key"',
+    ]
+
+    queries.extend(deep_queries)
+
+    clean_queries = []
+    seen = set()
+
+    for query in queries:
+        if query not in seen:
+            seen.add(query)
+            clean_queries.append(query)
+
+    return clean_queries
+
+
+def dedupe_findings(rows):
+    seen = set()
+    unique_rows = []
+
+    for row in rows:
+        key = (
+            row.get("repository"),
+            row.get("file"),
+            row.get("category"),
+            row.get("line"),
+            row.get("match")
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_rows.append(row)
+
+    return unique_rows
+
+
+def build_summary(rows):
+    summary = {}
+
+    for row in rows:
+        category = row["category"]
+        summary[category] = summary.get(category, 0) + 1
+
+    return dict(sorted(summary.items()))
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+
+
+def save_csv(path, rows):
+    fields = [
+        "repository",
+        "file",
+        "category",
+        "line",
+        "match",
+        "url",
+        "query"
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(row)
+
+
+def save_readme(path, target, rows):
+    summary = build_summary(rows)
+
+    lines = []
+
+    lines.append("# Git Secret Hunter Report")
+    lines.append("")
+    lines.append(f"Target: **{target}**")
+    lines.append("")
+    lines.append(f"Generated: {datetime.now()}")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(f"- Total Unique Findings: **{len(rows)}**")
+
+    for category, count in summary.items():
+        lines.append(f"- {category}: **{count}**")
+
+    lines.append("")
+    lines.append("## Findings")
+    lines.append("")
+
+    if not rows:
+        lines.append("No findings were detected.")
+
+    for row in rows:
+        lines.append(f"### {row['category']}")
+        lines.append("")
+        lines.append(f"- Repository: `{row['repository']}`")
+        lines.append(f"- File: `{row['file']}`")
+        lines.append(f"- Line: `{row['line']}`")
+        lines.append(f"- Match: `{row['match']}`")
+        lines.append(f"- Query: `{row['query']}`")
+        lines.append(f"- URL: {row['url']}")
+        lines.append("")
+
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("\n".join(lines))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Git Secret Hunter"
+    )
+
+    parser.add_argument(
+        "target",
+        help="Target domain/company"
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=2,
+        help="Pages per GitHub query"
+    )
+
+    parser.add_argument(
+        "--max-dorks",
+        type=int,
+        default=len(DORKS),
+        help="Number of dorks to use"
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=DEFAULT_DELAY,
+        help="Delay between queries in seconds"
+    )
+
+    args = parser.parse_args()
+
+    if not GITHUB_TOKEN or GITHUB_TOKEN == "PUT_TOKEN_HERE":
+        print("[-] Put your token in GITHUB_TOKEN")
+        return
+
+    if not validate_token():
+        return
+
+    keywords = generate_keywords(args.target)
+    queries = build_queries(args.target, args.max_dorks)
+
+    print(f"[+] Keywords: {keywords}")
+    print(f"[+] Total queries: {len(queries)}")
+    print(f"[+] Delay between queries: {args.delay} seconds")
+
+    findings = []
+    checked_files = set()
+
+    for index, query in enumerate(queries, start=1):
+        print(f"[+] Searching {index}/{len(queries)}: {query}")
+
+        items = search_github(query, args.max_pages)
+
+        for item in items:
+            repo = item.get("repository", {}).get("full_name")
+            path = item.get("path")
+            url = item.get("html_url")
+            api_url = item.get("url")
+
+            unique_file = f"{repo}:{path}"
+
+            if unique_file in checked_files:
+                continue
+
+            checked_files.add(unique_file)
+
+            content = get_file_content(api_url)
+
+            if not content:
+                continue
+
+            results = scan_text(content)
+
+            for result in results:
+                findings.append({
+                    "repository": repo,
+                    "file": path,
+                    "category": result["category"],
+                    "line": result["line"],
+                    "match": result["match"],
+                    "url": url,
+                    "query": query
+                })
+
+        time.sleep(args.delay)
+
+    findings = dedupe_findings(findings)
+    summary = build_summary(findings)
+
+    print("")
+    print("========== RESULTS ==========")
+    print(f"Total Unique Findings: {len(findings)}")
+    print("")
+
+    if summary:
+        for key, value in summary.items():
+            print(f"{key}: {value}")
+    else:
+        print("No findings")
+
+    output = {
+        "target": args.target,
+        "generated": str(datetime.now()),
+        "total_unique_findings": len(findings),
+        "summary": summary,
+        "findings": findings
+    }
+
+    save_json("git_secret_results.json", output)
+    save_csv("git_secret_results.csv", findings)
+    save_readme("git_secret_report.md", args.target, findings)
+
+    print("")
+    print("[+] Saved:")
+    print(" - git_secret_results.json")
+    print(" - git_secret_results.csv")
+    print(" - git_secret_report.md")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# py .\git-secret-hunter.py "example.com"
