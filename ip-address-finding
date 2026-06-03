@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+WebPwn - VirusTotal IP Address Collector with Live Check
+FIXED: Handles rate limits (429) with automatic retry and backoff
+Usage: python vt_ip_collector_live.py subdomains.txt
+"""
+
+import requests
+import re
+import time
+import sys
+import argparse
+from datetime import datetime
+from typing import Set, List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============================================
+# 🔑 YOUR VIRUSTOTAL API KEY
+# ============================================
+
+VIRUSTOTAL_KEY = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+# ============================================
+# ⚙️ CONFIGURATION
+# ============================================
+
+LIVE_STATUS_CODES = [200, 201, 202, 203, 204, 206, 300, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 421, 422, 423, 424, 425, 426, 428, 429, 431, 451, 500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511]
+REQUEST_TIMEOUT = 5
+MAX_THREADS = 10
+DELAY_BETWEEN_REQUESTS = 2  # Increased from 1 to 2 seconds
+MAX_RETRIES = 3
+
+# ============================================
+
+class VTIPCollector:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.all_ips: Set[str] = set()
+        self.live_ips: Dict[str, dict] = {}
+        self.dead_ips: Set[str] = set()
+        self.results: Dict[str, List[str]] = {}
+        self.session = requests.Session()
+        self.session.headers.update({
+            "x-apikey": api_key,
+            "User-Agent": "WebPwn-Scanner/1.0"
+        })
+        
+    def is_valid_ip(self, ip: str) -> bool:
+        """Validate IP address format"""
+        pattern = r'^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+        return re.match(pattern, ip) is not None
+    
+    def make_request_with_retry(self, url: str, retry_count: int = 0) -> dict:
+        """Make request with automatic retry on rate limit"""
+        try:
+            response = self.session.get(url, timeout=30)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                # Rate limited - wait and retry
+                wait_time = (retry_count + 1) * 10  # 10, 20, 30 seconds
+                print(f"         ⏳ Rate limited! Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                
+                if retry_count < MAX_RETRIES:
+                    return self.make_request_with_retry(url, retry_count + 1)
+                else:
+                    print(f"         ❌ Max retries reached for this request")
+                    return None
+            else:
+                print(f"         ❌ HTTP {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"         ❌ Error: {e}")
+            return None
+    
+    def extract_all_resolutions(self, domain: str) -> List[str]:
+        """Extract ALL IPs from VirusTotal resolutions with pagination and rate limit handling"""
+        all_ips = []
+        url = f"https://www.virustotal.com/api/v3/domains/{domain}/resolutions"
+        
+        page_count = 1
+        while url:
+            print(f"         📄 Fetching page {page_count}...", end=" ")
+            
+            data = self.make_request_with_retry(url)
+            
+            if data and 'data' in data:
+                # Extract IPs from this page
+                for item in data['data']:
+                    if 'attributes' in item:
+                        ip = item['attributes'].get('ip_address')
+                        if ip and self.is_valid_ip(ip):
+                            all_ips.append(ip)
+                            # Only print first few to avoid spam
+                            if len(all_ips) <= 10 or len(all_ips) % 50 == 0:
+                                print(f"\n            📍 Found: {ip}")
+                
+                # Check for next page link
+                links = data.get('links', {})
+                url = links.get('next')
+                
+                if url:
+                    print(f" → has more! (Total: {len(all_ips)} so far)")
+                    page_count += 1
+                    time.sleep(DELAY_BETWEEN_REQUESTS)  # Delay between pages
+                else:
+                    print(f" → done! Total: {len(all_ips)} IPs")
+                    url = None
+                    
+            else:
+                print(f" failed!")
+                break
+        
+        return list(set(all_ips))
+    
+    def query_subdomain(self, subdomain: str) -> List[str]:
+        """Query VirusTotal for a single subdomain - gets ALL resolutions"""
+        print(f"\n  [→] Querying VT: {subdomain}")
+        
+        # Add delay before query to respect rate limits
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+        
+        ips = self.extract_all_resolutions(subdomain)
+        
+        if ips:
+            print(f"      ✅ TOTAL: {len(ips)} unique IP(s) found")
+            # Show first 5 as sample
+            for ip in ips[:5]:
+                print(f"         • {ip}")
+            if len(ips) > 5:
+                print(f"         ... and {len(ips)-5} more")
+        else:
+            print(f"      ⚠️  No IPs found")
+        
+        return ips
+    
+    def check_ip_live(self, ip: str) -> Tuple[str, dict]:
+        """Check if an IP is live by making HTTP/HTTPS request"""
+        protocols = ['http', 'https']
+        
+        for protocol in protocols:
+            url = f"{protocol}://{ip}"
+            try:
+                start_time = time.time()
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                response_time = round((time.time() - start_time) * 1000, 2)
+                
+                if response.status_code in LIVE_STATUS_CODES:
+                    result = {
+                        'status': response.status_code,
+                        'url': url,
+                        'response_time': response_time,
+                        'server': response.headers.get('Server', 'Unknown')[:50]
+                    }
+                    return ip, result
+                    
+            except:
+                continue
+        
+        return ip, None
+    
+    def batch_check_live(self, ips: Set[str]) -> Tuple[Dict[str, dict], Set[str]]:
+        """Check multiple IPs concurrently"""
+        print(f"\n  [*] Checking {len(ips)} IPs for liveness...")
+        print(f"  [*] This may take a few minutes for {len(ips)} IPs...")
+        
+        live_ips = {}
+        dead_ips = set()
+        checked = 0
+        
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_ip = {executor.submit(self.check_ip_live, ip): ip for ip in ips}
+            
+            for future in as_completed(future_to_ip):
+                ip, result = future.result()
+                checked += 1
+                
+                if result:
+                    live_ips[ip] = result
+                    # Print live IPs as they're found
+                    print(f"      ✅ LIVE: {ip} → HTTP {result['status']} ({result['response_time']}ms)")
+                else:
+                    dead_ips.add(ip)
+                
+                # Show progress every 100 IPs
+                if checked % 100 == 0:
+                    print(f"      [Progress: {checked}/{len(ips)} - {len(live_ips)} live so far]")
+        
+        print(f"\n      📊 Summary: {len(live_ips)} live, {len(dead_ips)} dead")
+        return live_ips, dead_ips
+    
+    def collect_from_list(self, subdomains: List[str], delay: float = 2.0, check_live: bool = True) -> Set[str]:
+        """Collect IPs from a list of subdomains"""
+        print(f"""
+╔══════════════════════════════════════════════════════════╗
+║         WebPwn - IP Collector with Live Check           ║
+║    VirusTotal - FULL HISTORICAL IP EXTRACTION          ║
+║         (Handles rate limits automatically)            ║
+╚══════════════════════════════════════════════════════════╝
+        """)
+        
+        print(f"[*] Total subdomains: {len(subdomains)}")
+        print(f"[*] Source: VirusTotal API (paginated resolutions)")
+        print(f"[*] Delay between requests: {delay} seconds")
+        print(f"[*] Live check: {'Enabled' if check_live else 'Disabled'}")
+        print(f"[*] Max retries on rate limit: {MAX_RETRIES}\n")
+        
+        # Phase 1: Collect IPs
+        print("[Phase 1] Collecting ALL historical IPs from VirusTotal...")
+        print("-" * 50)
+        
+        for idx, subdomain in enumerate(subdomains, 1):
+            print(f"\n[{idx}/{len(subdomains)}]", end="")
+            ips = self.query_subdomain(subdomain.strip())
+            
+            if ips:
+                self.all_ips.update(ips)
+                self.results[subdomain] = ips
+            
+            # Longer delay between different subdomains
+            if idx < len(subdomains):
+                print(f"      ⏳ Waiting {delay} seconds before next subdomain...")
+                time.sleep(delay)
+        
+        # Phase 2: Check liveness
+        if check_live and self.all_ips:
+            print(f"\n[Phase 2] Checking liveness of {len(self.all_ips)} IPs...")
+            print("-" * 50)
+            self.live_ips, self.dead_ips = self.batch_check_live(self.all_ips)
+        else:
+            self.live_ips = {ip: {'status': 'Unknown', 'url': f'http://{ip}', 'response_time': 0} for ip in self.all_ips}
+        
+        return set(self.live_ips.keys())
+    
+    def save_results(self, output_prefix: str = "webpwn"):
+        """Save results to files"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Detailed report with all IPs
+        detail_file = f"{output_prefix}_detailed_{timestamp}.txt"
+        with open(detail_file, 'w') as f:
+            f.write(f"# WebPwn - IP Collection Results\n")
+            f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Total Subdomains: {len(self.results)}\n")
+            f.write(f"# Total IPs from VT: {len(self.all_ips)}\n")
+            f.write(f"# Live IPs: {len(self.live_ips)}\n")
+            f.write(f"# Dead IPs: {len(self.dead_ips)}\n")
+            f.write(f"\n# ========================================\n")
+            f.write(f"# LIVE IPs ONLY ({len(self.live_ips)} total)\n")
+            f.write(f"# ========================================\n\n")
+            for ip, info in sorted(self.live_ips.items(), key=lambda x: x[1]['status']):
+                f.write(f"{ip} | HTTP {info['status']} | {info['response_time']}ms | {info['url']}\n")
+            
+            f.write(f"\n# ========================================\n")
+            f.write(f"# ALL IPs FROM VIRUSTOTAL ({len(self.all_ips)} total)\n")
+            f.write(f"# ========================================\n\n")
+            for ip in sorted(self.all_ips):
+                f.write(f"{ip}\n")
+        
+        # Simple live IPs (one per line)
+        live_file = f"{output_prefix}_live_{timestamp}.txt"
+        with open(live_file, 'w') as f:
+            for ip in sorted(self.live_ips.keys()):
+                f.write(f"{ip}\n")
+        
+        # All IPs from VT (one per line)
+        all_ips_file = f"{output_prefix}_all_ips_{timestamp}.txt"
+        with open(all_ips_file, 'w') as f:
+            for ip in sorted(self.all_ips):
+                f.write(f"{ip}\n")
+        
+        return detail_file, live_file, all_ips_file
+    
+    def print_summary(self):
+        """Print summary"""
+        print(f"\n{'='*60}")
+        print(f"📊 SUMMARY")
+        print(f"{'='*60}")
+        print(f"Subdomains scanned: {len(self.results)}")
+        print(f"\n📈 IP Stats:")
+        print(f"  • Total IPs from VirusTotal: {len(self.all_ips)}")
+        print(f"  • ✅ Live IPs: {len(self.live_ips)}")
+        print(f"  • ❌ Dead IPs: {len(self.dead_ips)}")
+        
+        if self.all_ips:
+            print(f"  • Live Ratio: {len(self.live_ips)/len(self.all_ips)*100:.1f}%")
+        
+        if self.live_ips:
+            print(f"\n✅ Status Code Breakdown:")
+            status_counts = {}
+            for info in self.live_ips.values():
+                status = info['status']
+                status_counts[status] = status_counts.get(status, 0) + 1
+            for status, count in sorted(status_counts.items()):
+                print(f"  • HTTP {status}: {count}")
+        
+        print(f"{'='*60}")
+
+
+def load_subdomains_from_file(filename: str) -> List[str]:
+    """Load subdomains from file (one per line)"""
+    try:
+        with open(filename, 'r') as f:
+            subdomains = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        return subdomains
+    except FileNotFoundError:
+        print(f"[!] File not found: {filename}")
+        return []
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='WebPwn - VirusTotal IP Collector (Full Historical IP Extraction)',
+        epilog='Examples:\n'
+               '  python vt_ip_collector_live.py subdomains.txt\n'
+               '  python vt_ip_collector_live.py -m "github.com,att.com"'
+    )
+    
+    parser.add_argument('file', nargs='?', help='File containing subdomains (one per line)')
+    parser.add_argument('-f', '--file', help='File containing subdomains')
+    parser.add_argument('-m', '--manual', help='Manual subdomains (comma-separated)')
+    parser.add_argument('-o', '--output', default='webpwn', help='Output file prefix')
+    parser.add_argument('-n', '--no-live', action='store_true', help='Skip live checking (faster)')
+    
+    args = parser.parse_args()
+    
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║                    WebPwn Framework                     ║
+║    VirusTotal IP Collector - FULL HISTORICAL EXTRACTION║
+║   (Extracts ALL IPs from paginated resolutions)        ║
+╚══════════════════════════════════════════════════════════╝
+    """)
+    
+    # Check API key
+    if VIRUSTOTAL_KEY == "YOUR_VIRUSTOTAL_KEY_HERE":
+        print("[!] ERROR: Please add your VirusTotal API key to the script!")
+        print("    Edit the file and set VIRUSTOTAL_KEY = 'your_key_here'")
+        sys.exit(1)
+    
+    # Get subdomains
+    subdomains = []
+    
+    if args.file:
+        subdomains = load_subdomains_from_file(args.file)
+    elif args.manual:
+        subdomains = [s.strip() for s in args.manual.split(",") if s.strip()]
+    elif args.file:
+        subdomains = load_subdomains_from_file(args.file)
+    else:
+        # Interactive mode
+        filename = input("Enter subdomains file name (or press Enter for manual): ").strip()
+        if filename:
+            subdomains = load_subdomains_from_file(filename)
+        
+        if not subdomains:
+            manual = input("Enter subdomains (comma-separated): ")
+            subdomains = [s.strip() for s in manual.split(",") if s.strip()]
+    
+    if not subdomains:
+        print("[!] No subdomains provided. Exiting.")
+        sys.exit(1)
+    
+    print(f"\n[*] Loaded {len(subdomains)} subdomains")
+    print(f"[*] Output prefix: {args.output}")
+    print(f"[*] Live check: {'Disabled (faster)' if args.no_live else 'Enabled (may take time)'}")
+    
+    # Create collector and run
+    collector = VTIPCollector(VIRUSTOTAL_KEY)
+    
+    # Ask about live check if many IPs expected
+    if not args.no_live and len(subdomains) > 3:
+        print(f"\n⚠️  Warning: Checking liveness on potentially thousands of IPs may take time.")
+        response = input("Continue with live check? (y/n, default: y): ").strip().lower()
+        if response == 'n':
+            args.no_live = True
+    
+    live_ips = collector.collect_from_list(subdomains, check_live=not args.no_live)
+    
+    # Save results
+    if collector.all_ips:
+        detail_file, live_file, all_ips_file = collector.save_results(args.output)
+        collector.print_summary()
+        print(f"\n✅ Results saved to:")
+        print(f"   • Detailed report: {detail_file}")
+        print(f"   • Live IPs only: {live_file}")
+        print(f"   • All IPs from VT: {all_ips_file}")
+        
+        # Show live IPs
+        if collector.live_ips:
+            print(f"\n🎯 LIVE IPs Found ({len(collector.live_ips)}):")
+            for ip in sorted(collector.live_ips)[:20]:
+                info = collector.live_ips[ip]
+                print(f"   • {ip} → HTTP {info['status']} ({info['response_time']}ms)")
+            if len(collector.live_ips) > 20:
+                print(f"   ... and {len(collector.live_ips)-20} more")
+    else:
+        print(f"\n❌ No IPs found")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# py vt_ip_collector.py "target"
+# py vt_ip_collector.py "amazon.com,github.com,google.com"
