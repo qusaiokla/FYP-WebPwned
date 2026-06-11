@@ -723,5 +723,11 @@ def main():
 if __name__ == "__main__":
     main()
 
-#python3 js_secret_scanner.py -l test -o results/scan.json --workers 20
-#python3 js_secret_scanner.py -l test -o results/scan.json --workers 20 --recursive --depth 2
+# Default — scans 3 levels deep into JS-inside-JS
+py js_secret_scanner.py -u https://vueling.com
+
+# Go deeper (5 levels)
+py js_secret_scanner.py -u https://vueling.com --depth 5
+
+# Scan all alive subdomains
+py js_secret_scanner.py -l subenum-vueling.com/alive-subs.txt --depth 3
