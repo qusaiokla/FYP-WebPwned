@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+WebPwn - CORS Misconfiguration Scanner
+Tests every known CORS bypass technique with near-zero false positives.
+Severity is only marked exploitable when BOTH conditions are true:
+  1. ACAO reflects/allows the injected origin
+  2. ACAC (Access-Control-Allow-Credentials) is true
+  OR the misconfiguration is dangerous regardless of credentials (wildcard + credentials).
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from urllib.parse import urlparse
+
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─────────────────────────────────────────
+# VERSION & LEGAL
+# ─────────────────────────────────────────
+VERSION = "1.0"
+BANNER  = f"""
+╔══════════════════════════════════════════════════════╗
+║           WebPwn CORS Misconfiguration Scanner       ║
+║                     Version {VERSION}                      ║
+╠══════════════════════════════════════════════════════╣
+║  For authorized security testing ONLY.               ║
+║  Unauthorized use is illegal and unethical.          ║
+╚══════════════════════════════════════════════════════╝
+"""
+
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
+DEFAULT_TIMEOUT   = 10
+DEFAULT_THREADS   = 10
+DEFAULT_DELAY     = 0
+DEFAULT_RETRIES   = 2
+USER_AGENT        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+
+# ANSI colors
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+BLUE   = "\033[94m"
+CYAN   = "\033[96m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+
+SEV_COLOR = {
+    "CRITICAL": RED,
+    "HIGH":     RED,
+    "MEDIUM":   YELLOW,
+    "LOW":      CYAN,
+    "INFO":     GREEN,
+    "NONE":     GREEN,
+}
+
+
+# ─────────────────────────────────────────
+# TEST CASE DEFINITIONS
+# ─────────────────────────────────────────
+# Each test case:
+#   id          : unique identifier
+#   name        : human label
+#   description : what it tests
+#   severity    : base severity (upgraded to CRITICAL if credentials: true)
+#   origin_fn   : function(target_origin) → origin to inject
+#   exploitable_tip : what an attacker can do if this fires
+
+def _origin(target: str) -> dict:
+    """Parse target URL into parts for building test origins."""
+    p = urlparse(target)
+    scheme = p.scheme or "https"
+    host   = p.netloc or p.path
+    return {"scheme": scheme, "host": host, "full": f"{scheme}://{host}"}
+
+
+TEST_CASES = [
+    {
+        "id":          "reflect_any",
+        "name":        "Origin Reflection",
+        "description": "Server blindly reflects any Origin in ACAO header",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: "https://evil.attacker.com",
+        "tip":         "Attacker can read authenticated API responses from any domain.",
+    },
+    {
+        "id":          "null_origin",
+        "name":        "Null Origin Trusted",
+        "description": "Server accepts 'null' as a valid origin (sandboxed iframes)",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: "null",
+        "tip":         "Exploit via sandboxed iframe: <iframe sandbox='allow-scripts' srcdoc='...'> to send null-origin requests.",
+    },
+    {
+        "id":          "wildcard_creds",
+        "name":        "Wildcard with Credentials",
+        "description": "ACAO: * combined with ACAC: true (browser blocks but server is misconfigured)",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: "https://evil.attacker.com",
+        "tip":         "Server misconfigured. Modern browsers block this combination but older clients may not.",
+    },
+    {
+        "id":          "prefix_bypass",
+        "name":        "Prefix Match Bypass",
+        "description": "Origin validated only by prefix — attacker prepends target domain",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: f"https://{_origin(o)['host']}.evil.com",
+        "tip":         "Register <target-domain>.evil.com and host exploit there.",
+    },
+    {
+        "id":          "suffix_bypass",
+        "name":        "Suffix Match Bypass",
+        "description": "Origin validated only by suffix — attacker appends target domain",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: f"https://evil{_origin(o)['host']}",
+        "tip":         "Register evil<target-domain> and host exploit there.",
+    },
+    {
+        "id":          "dot_bypass",
+        "name":        "Dot Before Domain Bypass",
+        "description": "Regex uses unescaped dot — any char before domain matches",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: f"https://evilX{_origin(o)['host'].lstrip('www.')}",
+        "tip":         "Unescaped dot in server regex. Register a domain that satisfies the pattern.",
+    },
+    {
+        "id":          "underscore_bypass",
+        "name":        "Underscore Subdomain Bypass",
+        "description": "Some parsers allow underscores in subdomains which bypass regex",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: f"https://evil_subdomain.{_origin(o)['host']}",
+        "tip":         "Some CORS validators allow underscores in subdomain labels, bypassing strict checks.",
+    },
+    {
+        "id":          "backtick_bypass",
+        "name":        "Backtick Origin Bypass",
+        "description": "Backtick in origin confuses naive parsers",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: f"https://evil`{_origin(o)['host']}",
+        "tip":         "Certain server-side frameworks misparse backtick-containing origins.",
+    },
+    {
+        "id":          "http_downgrade",
+        "name":        "HTTP Origin Trusted (HTTPS target)",
+        "description": "HTTPS target accepts HTTP origin — allows MitM downgrade",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: f"http://{_origin(o)['host']}",
+        "tip":         "Attacker on same network can intercept HTTP traffic and inject exploit page.",
+    },
+    {
+        "id":          "subdomain_wildcard",
+        "name":        "Arbitrary Subdomain Trusted",
+        "description": "Any subdomain of the target is trusted — exploitable via XSS on any subdomain",
+        "severity":    "HIGH",
+        "origin_fn":   lambda o: f"https://evil.{_origin(o)['host']}",
+        "tip":         "Find any XSS on any subdomain. Combined with that XSS, full CORS exploit is possible.",
+    },
+    {
+        "id":          "third_party",
+        "name":        "Third-Party Origin Trusted",
+        "description": "A well-known third-party domain is trusted",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: "https://jsbin.com",
+        "tip":         "Host exploit payload on the trusted third-party domain.",
+    },
+    {
+        "id":          "localhost_trust",
+        "name":        "Localhost Origin Trusted",
+        "description": "Server trusts localhost/127.0.0.1 origins",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: "http://localhost",
+        "tip":         "Useful for internal network pivoting or local service exploitation.",
+    },
+    {
+        "id":          "localhost_port",
+        "name":        "Localhost with Port Trusted",
+        "description": "Server trusts localhost with a specific port",
+        "severity":    "LOW",
+        "origin_fn":   lambda o: "http://localhost:8080",
+        "tip":         "May allow local application to read cross-origin data.",
+    },
+    {
+        "id":          "127_trust",
+        "name":        "127.0.0.1 Origin Trusted",
+        "description": "Server explicitly trusts 127.0.0.1",
+        "severity":    "MEDIUM",
+        "origin_fn":   lambda o: "http://127.0.0.1",
+        "tip":         "Internal network requests or SSRF chaining possible.",
+    },
+    {
+        "id":          "special_chars",
+        "name":        "Special Characters in Origin",
+        "description": "Origin with special chars bypasses naive string comparison",
+        "severity":    "LOW",
+        "origin_fn":   lambda o: f"https://{_origin(o)['host']}%60.evil.com",
+        "tip":         "URL-encoded special chars may bypass origin validation in some frameworks.",
+    },
+    {
+        "id":          "no_origin",
+        "name":        "Missing Origin Header",
+        "description": "Request with no Origin header — checks if ACAO is set to * unconditionally",
+        "severity":    "INFO",
+        "origin_fn":   lambda o: None,   # special: send NO origin header
+        "tip":         "Wildcard ACAO without Origin present may indicate blanket misconfiguration.",
+    },
+]
+
+
+# ─────────────────────────────────────────
+# HTTP ENGINE
+# ─────────────────────────────────────────
+class CORSScanner:
+    def __init__(self, config: dict):
+        self.timeout     = config.get("timeout",  DEFAULT_TIMEOUT)
+        self.retries     = config.get("retries",  DEFAULT_RETRIES)
+        self.delay       = config.get("delay",    DEFAULT_DELAY)
+        self.proxy       = config.get("proxy")
+        self.verify_ssl  = config.get("verify_ssl", True)
+        self.extra_headers = config.get("headers", {})
+        self.methods     = config.get("methods",  ["GET"])
+        self.verbose     = config.get("verbose",  False)
+        self.quiet       = config.get("quiet",    False)
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept":     "*/*",
+        })
+        if self.extra_headers:
+            self.session.headers.update(self.extra_headers)
+        if self.proxy:
+            self.session.proxies = {"http": self.proxy, "https": self.proxy}
+
+    def _request(self, url: str, origin: str | None, method: str = "GET") -> requests.Response | None:
+        headers = {}
+        if origin is not None:
+            headers["Origin"] = origin
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                r = self.session.request(
+                    method, url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                    verify=self.verify_ssl,
+                )
+                return r
+            except requests.exceptions.SSLError:
+                # Retry without SSL verification
+                try:
+                    r = self.session.request(
+                        method, url,
+                        headers=headers,
+                        timeout=self.timeout,
+                        allow_redirects=True,
+                        verify=False,
+                    )
+                    return r
+                except Exception:
+                    return None
+            except Exception as e:
+                if attempt == self.retries:
+                    return None
+                time.sleep(1)
+        return None
+
+    def _analyze_response(self, response: requests.Response, injected_origin: str | None) -> dict:
+        """
+        Analyze CORS headers in the response.
+        Returns a dict of all relevant findings.
+        """
+        if response is None:
+            return {}
+
+        headers = {k.lower(): v for k, v in response.headers.items()}
+
+        acao = headers.get("access-control-allow-origin", "")
+        acac = headers.get("access-control-allow-credentials", "").lower() == "true"
+        acam = headers.get("access-control-allow-methods", "")
+        acah = headers.get("access-control-allow-headers", "")
+        aceh = headers.get("access-control-expose-headers", "")
+        vary = headers.get("vary", "")
+
+        # Check if our injected origin was reflected
+        origin_reflected = (
+            injected_origin is not None
+            and acao == injected_origin
+        )
+
+        # Check for wildcard
+        is_wildcard = acao == "*"
+
+        # Check for null origin accepted
+        null_accepted = (injected_origin == "null" and acao == "null")
+
+        return {
+            "acao":             acao,
+            "acac":             acac,
+            "acam":             acam,
+            "acah":             acah,
+            "aceh":             aceh,
+            "vary":             vary,
+            "origin_reflected": origin_reflected,
+            "is_wildcard":      is_wildcard,
+            "null_accepted":    null_accepted,
+            "status_code":      response.status_code,
+        }
+
+    def run_test(self, url: str, test_case: dict, method: str = "GET") -> dict:
+        """Run a single test case against a URL."""
+        injected_origin = test_case["origin_fn"](url)
+
+        response = self._request(url, injected_origin, method)
+        if not response:
+            return {
+                "test_id":  test_case["id"],
+                "url":      url,
+                "method":   method,
+                "error":    "No response",
+                "vulnerable": False,
+                "severity": "NONE",
+            }
+
+        analysis = self._analyze_response(response, injected_origin)
+
+        # ── Vulnerability logic (no false positives) ──────────────
+        vulnerable   = False
+        severity     = "NONE"
+        vuln_reason  = ""
+
+        acao = analysis.get("acao", "")
+        acac = analysis.get("acac", False)
+
+        # Rule 1: Origin reflected + credentials = HIGH/CRITICAL
+        if analysis.get("origin_reflected") and acac:
+            vulnerable  = True
+            severity    = "CRITICAL"
+            vuln_reason = f"Origin reflected ({injected_origin}) + credentials=true → full account takeover possible"
+
+        # Rule 2: Origin reflected without credentials = MEDIUM (data leak, no session)
+        elif analysis.get("origin_reflected") and not acac:
+            vulnerable  = True
+            severity    = "MEDIUM"
+            vuln_reason = f"Origin reflected ({injected_origin}) but no credentials — unauthenticated data leak only"
+
+        # Rule 3: Null origin accepted + credentials
+        elif analysis.get("null_accepted") and acac:
+            vulnerable  = True
+            severity    = "CRITICAL"
+            vuln_reason = "null origin accepted + credentials=true → sandboxed iframe exploit possible"
+
+        # Rule 4: Null origin accepted without credentials
+        elif analysis.get("null_accepted") and not acac:
+            vulnerable  = True
+            severity    = "MEDIUM"
+            vuln_reason = "null origin accepted — limited data exposure without credentials"
+
+        # Rule 5: Wildcard + credentials (browser blocks but misconfigured)
+        elif analysis.get("is_wildcard") and acac:
+            vulnerable  = True
+            severity    = "MEDIUM"
+            vuln_reason = "Wildcard ACAO with credentials=true — browsers block this but it signals misconfiguration"
+
+        # Rule 6: Wildcard without credentials (info only, no real exploit)
+        elif analysis.get("is_wildcard") and not acac:
+            vulnerable  = False
+            severity    = "INFO"
+            vuln_reason = "Wildcard ACAO without credentials — public resource, low risk"
+
+        # Upgrade base severity from test case definition if credentials are present
+        if vulnerable and acac and severity not in ("CRITICAL",):
+            sev_map = {"MEDIUM": "HIGH", "LOW": "MEDIUM", "HIGH": "CRITICAL"}
+            severity = sev_map.get(severity, severity)
+
+        result = {
+            "test_id":          test_case["id"],
+            "test_name":        test_case["name"],
+            "description":      test_case["description"],
+            "url":              url,
+            "method":           method,
+            "injected_origin":  injected_origin,
+            "acao":             acao,
+            "acac":             acac,
+            "acam":             analysis.get("acam", ""),
+            "vary":             analysis.get("vary", ""),
+            "status_code":      analysis.get("status_code"),
+            "vulnerable":       vulnerable,
+            "severity":         severity,
+            "reason":           vuln_reason,
+            "tip":              test_case.get("tip", "") if vulnerable else "",
+        }
+
+        return result
+
+    def scan_url(self, url: str) -> dict:
+        """
+        Run all test cases against one URL.
+        Returns a summary dict with all results.
+        """
+        if self.delay:
+            time.sleep(self.delay)
+
+        url_results = {
+            "url":         url,
+            "scanned_at":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "vulnerable":  False,
+            "max_severity": "NONE",
+            "findings":    [],
+            "security_headers": {},
+        }
+
+        # First: baseline request (no origin) to get security headers
+        baseline = self._request(url, None)
+        if baseline:
+            h = {k.lower(): v for k, v in baseline.headers.items()}
+            url_results["security_headers"] = {
+                "x-frame-options":         h.get("x-frame-options", "MISSING"),
+                "content-security-policy": h.get("content-security-policy", "MISSING"),
+                "strict-transport-security": h.get("strict-transport-security", "MISSING"),
+                "x-content-type-options":  h.get("x-content-type-options", "MISSING"),
+            }
+
+        # Run all test cases across all methods
+        for test_case in TEST_CASES:
+            for method in self.methods:
+                result = self.run_test(url, test_case, method)
+
+                if result.get("vulnerable"):
+                    url_results["vulnerable"] = True
+                    url_results["findings"].append(result)
+
+                    # Track max severity
+                    sev_order = ["NONE", "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+                    current   = url_results["max_severity"]
+                    new_sev   = result["severity"]
+                    if sev_order.index(new_sev) > sev_order.index(current):
+                        url_results["max_severity"] = new_sev
+
+                elif result.get("severity") == "INFO" and result.get("acao"):
+                    # Always include INFO findings (wildcard etc)
+                    url_results["findings"].append(result)
+
+        return url_results
+
+
+# ─────────────────────────────────────────
+# OUTPUT FORMATTERS
+# ─────────────────────────────────────────
+print_lock = threading.Lock()
+
+
+def color_severity(sev: str) -> str:
+    return f"{SEV_COLOR.get(sev, '')}{BOLD}{sev}{RESET}"
+
+
+def print_result(result: dict, quiet: bool = False):
+    with print_lock:
+        url      = result["url"]
+        findings = result["findings"]
+        max_sev  = result["max_severity"]
+
+        if not findings:
+            print(f"  {GREEN}[✓] SAFE{RESET}  {url}")
+            return
+
+        vuln_findings = [f for f in findings if f.get("vulnerable")]
+        info_findings = [f for f in findings if not f.get("vulnerable")]
+
+        if vuln_findings:
+            print(f"\n  {SEV_COLOR.get(max_sev, '')}{BOLD}[{max_sev}]{RESET}  {url}")
+        else:
+            print(f"\n  {CYAN}[INFO]{RESET}  {url}")
+
+        for f in vuln_findings:
+            sev_str = color_severity(f["severity"])
+            print(f"    ├─ [{sev_str}] {f['test_name']}")
+            print(f"    │   Origin  : {f['injected_origin']}")
+            print(f"    │   ACAO    : {f['acao']}")
+            print(f"    │   Creds   : {f['acac']}")
+            print(f"    │   Methods : {f['acam'] or 'not set'}")
+            print(f"    │   Reason  : {f['reason']}")
+            if not quiet and f.get("tip"):
+                print(f"    │   {YELLOW}Exploit{RESET}  : {f['tip']}")
+            print(f"    │")
+
+        for f in info_findings:
+            print(f"    ├─ [INFO] {f['test_name']} → ACAO: {f['acao']}")
+
+        # Security headers
+        if not quiet:
+            sh = result.get("security_headers", {})
+            missing = [k for k, v in sh.items() if v == "MISSING"]
+            if missing:
+                print(f"    └─ {YELLOW}Missing security headers:{RESET} {', '.join(missing)}")
+
+
+def generate_html_report(all_results: list, output_file: str):
+    """Generate a self-contained HTML report with charts."""
+    total      = len(all_results)
+    vulnerable = [r for r in all_results if r["vulnerable"]]
+    safe       = total - len(vulnerable)
+
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for r in all_results:
+        sev = r.get("max_severity", "NONE")
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+
+    findings_rows = ""
+    for r in all_results:
+        for f in r.get("findings", []):
+            if not f.get("vulnerable"):
+                continue
+            sev   = f.get("severity", "NONE")
+            color = {"CRITICAL": "#e74c3c", "HIGH": "#e74c3c",
+                     "MEDIUM": "#f39c12", "LOW": "#3498db"}.get(sev, "#27ae60")
+            findings_rows += f"""
+            <tr>
+              <td>{r['url']}</td>
+              <td>{f['test_name']}</td>
+              <td style="color:{color};font-weight:bold">{sev}</td>
+              <td>{f['injected_origin']}</td>
+              <td>{f['acao']}</td>
+              <td>{'Yes' if f['acac'] else 'No'}</td>
+              <td>{f['reason']}</td>
+              <td>{f.get('tip','')}</td>
+            </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebPwn CORS Scan Report</title>
+<style>
+  body {{ font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
+  h1   {{ color: #e94560; }} h2 {{ color: #0f3460; background:#16213e; padding:10px; border-radius:5px; }}
+  .stat-grid {{ display:flex; gap:20px; margin:20px 0; flex-wrap:wrap; }}
+  .stat {{ background:#16213e; border-radius:8px; padding:20px; min-width:120px; text-align:center; }}
+  .stat .num {{ font-size:2em; font-weight:bold; }}
+  .critical {{ color:#e74c3c; }} .high {{ color:#e74c3c; }}
+  .medium {{ color:#f39c12; }} .low {{ color:#3498db; }} .safe {{ color:#27ae60; }}
+  table {{ width:100%; border-collapse:collapse; margin-top:20px; }}
+  th    {{ background:#0f3460; padding:10px; text-align:left; }}
+  td    {{ padding:8px; border-bottom:1px solid #333; font-size:0.85em; vertical-align:top; }}
+  tr:hover {{ background:#16213e; }}
+  .badge {{ padding:3px 8px; border-radius:4px; font-size:0.8em; font-weight:bold; }}
+</style>
+</head>
+<body>
+<h1>WebPwn CORS Scanner Report</h1>
+<p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Tool: WebPwn v{VERSION}</p>
+
+<div class="stat-grid">
+  <div class="stat"><div class="num">{total}</div>Targets</div>
+  <div class="stat"><div class="num safe">{safe}</div>Safe</div>
+  <div class="stat"><div class="num critical">{sev_counts['CRITICAL']}</div>Critical</div>
+  <div class="stat"><div class="num high">{sev_counts['HIGH']}</div>High</div>
+  <div class="stat"><div class="num medium">{sev_counts['MEDIUM']}</div>Medium</div>
+  <div class="stat"><div class="num low">{sev_counts['LOW']}</div>Low/Info</div>
+</div>
+
+<h2>Vulnerable Findings</h2>
+<table>
+<tr>
+  <th>URL</th><th>Test</th><th>Severity</th><th>Origin Sent</th>
+  <th>ACAO Received</th><th>Credentials</th><th>Reason</th><th>Exploit Tip</th>
+</tr>
+{findings_rows if findings_rows else '<tr><td colspan="8" style="text-align:center;color:#27ae60">No vulnerable findings</td></tr>'}
+</table>
+</body>
+</html>"""
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def save_json_report(all_results: list, output_file: str):
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "tool":       "WebPwn CORS Scanner",
+            "version":    VERSION,
+            "generated":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total":      len(all_results),
+            "vulnerable": sum(1 for r in all_results if r["vulnerable"]),
+            "results":    all_results,
+        }, f, indent=2)
+
+
+def save_csv_report(all_results: list, output_file: str):
+    fields = ["url", "test_name", "severity", "injected_origin",
+              "acao", "acac", "vulnerable", "reason", "tip"]
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for r in all_results:
+            for finding in r.get("findings", []):
+                if finding.get("vulnerable"):
+                    writer.writerow({
+                        "url":            r["url"],
+                        "test_name":      finding.get("test_name", ""),
+                        "severity":       finding.get("severity", ""),
+                        "injected_origin": finding.get("injected_origin", ""),
+                        "acao":           finding.get("acao", ""),
+                        "acac":           finding.get("acac", ""),
+                        "vulnerable":     finding.get("vulnerable", False),
+                        "reason":         finding.get("reason", ""),
+                        "tip":            finding.get("tip", ""),
+                    })
+
+
+def save_txt_report(all_results: list, output_file: str):
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"WebPwn CORS Scanner Report\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
+        for r in all_results:
+            f.write(f"URL: {r['url']}\n")
+            f.write(f"Vulnerable: {r['vulnerable']} | Max Severity: {r['max_severity']}\n")
+            for finding in r.get("findings", []):
+                if finding.get("vulnerable"):
+                    f.write(f"  [{finding['severity']}] {finding['test_name']}\n")
+                    f.write(f"    Origin: {finding['injected_origin']}\n")
+                    f.write(f"    ACAO:   {finding['acao']}\n")
+                    f.write(f"    Reason: {finding['reason']}\n")
+                    f.write(f"    Tip:    {finding['tip']}\n\n")
+            f.write("\n")
+
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+def load_targets(url: str | None, file: str | None) -> list:
+    targets = []
+
+    if url:
+        targets.append(url.strip())
+
+    if file:
+        with open(file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if not line.startswith("http"):
+                    line = "https://" + line
+                targets.append(line)
+
+    if not sys.stdin.isatty() and not url and not file:
+        for line in sys.stdin:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                if not line.startswith("http"):
+                    line = "https://" + line
+                targets.append(line)
+
+    return list(dict.fromkeys(targets))   # deduplicate, preserve order
+
+
+def parse_headers(header_list: list) -> dict:
+    headers = {}
+    for h in (header_list or []):
+        if ":" in h:
+            k, v = h.split(":", 1)
+            headers[k.strip()] = v.strip()
+    return headers
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="WebPwn CORS Misconfiguration Scanner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  py cors_scanner.py -u https://api.example.com
+  py cors_scanner.py -l alive-subs.txt --threads 20
+  py cors_scanner.py -u https://api.example.com --methods GET POST --output-html report.html
+  py cors_scanner.py -l targets.txt --only-vulnerable --output-json results.json
+  py cors_scanner.py -u https://api.example.com -H "Authorization: Bearer token" --proxy http://127.0.0.1:8080
+        """
+    )
+
+    # Target
+    parser.add_argument("-u", "--url",           help="Single target URL")
+    parser.add_argument("-l", "--list",          help="File of URLs/domains")
+
+    # Scan options
+    parser.add_argument("--methods",    nargs="+", default=["GET"],
+                        help="HTTP methods to test (default: GET)")
+    parser.add_argument("--threads",    type=int, default=DEFAULT_THREADS)
+    parser.add_argument("--timeout",    type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--delay",      type=float, default=DEFAULT_DELAY,
+                        help="Delay in seconds between requests")
+    parser.add_argument("--retries",    type=int, default=DEFAULT_RETRIES)
+    parser.add_argument("--no-ssl-verify", action="store_true",
+                        help="Disable SSL certificate verification")
+    parser.add_argument("--proxy",      help="Proxy URL e.g. http://127.0.0.1:8080")
+    parser.add_argument("-H", "--header", action="append", dest="headers",
+                        help="Custom header (repeatable): 'Name: Value'")
+
+    # Output
+    parser.add_argument("--output-json", help="Save JSON report")
+    parser.add_argument("--output-csv",  help="Save CSV report")
+    parser.add_argument("--output-html", help="Save HTML report")
+    parser.add_argument("--output-txt",  help="Save TXT report")
+    parser.add_argument("--only-vulnerable", action="store_true",
+                        help="Print only vulnerable results")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Hide exploit tips and extra info")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--version", action="version", version=f"WebPwn CORS Scanner v{VERSION}")
+
+    args = parser.parse_args()
+
+    print(BANNER)
+
+    targets = load_targets(args.url, args.list)
+    if not targets:
+        print("[-] No targets provided. Use -u URL or -l file or pipe via stdin.")
+        sys.exit(1)
+
+    config = {
+        "timeout":    args.timeout,
+        "retries":    args.retries,
+        "delay":      args.delay,
+        "proxy":      args.proxy,
+        "verify_ssl": not args.no_ssl_verify,
+        "headers":    parse_headers(args.headers),
+        "methods":    [m.upper() for m in args.methods],
+        "verbose":    args.verbose,
+        "quiet":      args.quiet,
+    }
+
+    scanner    = CORSScanner(config)
+    all_results = []
+
+    print(f"[+] Targets  : {len(targets)}")
+    print(f"[+] Threads  : {args.threads}")
+    print(f"[+] Methods  : {', '.join(config['methods'])}")
+    print(f"[+] Tests    : {len(TEST_CASES)} CORS checks per URL")
+    print(f"[+] Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print("─" * 54)
+
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futures = {ex.submit(scanner.scan_url, t): t for t in targets}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                all_results.append(result)
+                if args.only_vulnerable and not result["vulnerable"]:
+                    continue
+                print_result(result, quiet=args.quiet)
+            except Exception as e:
+                print(f"  [!] Error scanning {futures[future]}: {e}")
+
+    # ── Summary ─────────────────────────────────────────
+    vuln_count = sum(1 for r in all_results if r["vulnerable"])
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for r in all_results:
+        sev = r.get("max_severity", "NONE")
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+
+    print(f"\n{'='*54}")
+    print(f"[+] DONE — {len(all_results)} targets scanned")
+    print(f"{'='*54}")
+    print(f"  Vulnerable   : {RED}{vuln_count}{RESET}")
+    print(f"  Critical     : {RED}{sev_counts['CRITICAL']}{RESET}")
+    print(f"  High         : {RED}{sev_counts['HIGH']}{RESET}")
+    print(f"  Medium       : {YELLOW}{sev_counts['MEDIUM']}{RESET}")
+    print(f"  Low/Info     : {CYAN}{sev_counts['LOW'] + sev_counts['INFO']}{RESET}")
+    print(f"  Safe         : {GREEN}{len(all_results) - vuln_count}{RESET}")
+
+    # ── Save reports ────────────────────────────────────
+    # ── Auto-generate txt filename ───────────────────────
+    if args.output_txt:
+        auto_txt = args.output_txt
+    elif args.url:
+        # e.g. https://api.vueling.com → cors_api_vueling_com.txt
+        host     = urlparse(args.url).netloc.replace(".", "_")
+        auto_txt = f"cors_{host}.txt"
+    elif args.list:
+        # e.g. alive-subs.txt → cors_alive-subs.txt
+        base     = os.path.splitext(os.path.basename(args.list))[0]
+        auto_txt = f"cors_{base}.txt"
+    else:
+        auto_txt = f"cors_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+    save_txt_report(all_results, auto_txt)
+
+    saved = [f"TXT   : {auto_txt}"]
+
+    if args.output_json:
+        save_json_report(all_results, args.output_json)
+        saved.append(f"JSON  : {args.output_json}")
+    if args.output_csv:
+        save_csv_report(all_results, args.output_csv)
+        saved.append(f"CSV   : {args.output_csv}")
+    if args.output_html:
+        generate_html_report(all_results, args.output_html)
+        saved.append(f"HTML  : {args.output_html}")
+
+    if saved:
+        print(f"\n  Reports saved:")
+        for s in saved:
+            print(f"    {s}")
+    print()
+
+
+# ─────────────────────────────────────────
+# LIBRARY API (importable)
+# ─────────────────────────────────────────
+def scan(url: str, config: dict = None) -> dict:
+    """
+    Use as a library in another script:
+      from cors_scanner import scan
+      result = scan("https://api.example.com", {"timeout": 5})
+    """
+    scanner = CORSScanner(config or {})
+    return scanner.scan_url(url)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+# Single URL
+py cors_scanner.py -u https://api.vueling.com
+
+# Full subdomain list
+py cors_scanner.py -l subenum-vueling.com/alive-subs.txt --threads 20
+
+# With auth token + HTML report
+py cors_scanner.py -l alive-subs.txt -H "Authorization: Bearer TOKEN" --output-html cors_report.html
+
+# Only show vulnerable, with proxy (Burp Suite)
+py cors_scanner.py -l alive-subs.txt --only-vulnerable --proxy http://127.0.0.1:8080
+
+# Test POST and PUT too
+py cors_scanner.py -u https://api.vueling.com --methods GET POST PUT
+
+
+py cors_scanner.py -u https://api.vueling.com
+→ saves: cors_api_vueling_com.txt
+
+py cors_scanner.py -l alive-subs.txt
+→ saves: cors_alive-subs.txt
+
+# Or give it a custom name if you want:
+py cors_scanner.py -l alive-subs.txt --output-txt my_report.txt
